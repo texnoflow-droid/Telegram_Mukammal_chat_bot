@@ -1,140 +1,141 @@
-import asyncio
+import telebot
+import time
 import logging
-import re
 import os
-from aiogram import Bot, Dispatcher, types, html, F
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReactionTypeEmoji
-from groq import Groq
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# --- CONFIGURATION ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-1003694678917"))
+# ================== CONFIGURATION ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SECRET_CHANNEL_ID = int(os.getenv("SECRET_CHANNEL_ID", "-1001234567890"))
 
-if not GROQ_API_KEY or not TELEGRAM_TOKEN:
-    raise ValueError("Please set GROQ_API_KEY and TELEGRAM_TOKEN in .env file")
+# List of target channels/groups for broadcasting
+TARGET_CHATS_STR = os.getenv("TARGET_CHATS", "")
+TARGET_CHATS = [int(x.strip()) for x in TARGET_CHATS_STR.split(",") if x.strip()]
 
-client = Groq(api_key=GROQ_API_KEY)
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+if not BOT_TOKEN:
+    raise ValueError("Please set BOT_TOKEN in .env file")
 
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 logging.basicConfig(level=logging.INFO)
 
+# ================== MEMORY ==================
+USER_STATE = {}
+MESSAGE_OWNER = {}
 
-# --- 1. ADMIN REPLY TO USER (REPLY SYSTEM) ---
-@dp.message(F.chat.id == LOG_GROUP_ID, F.reply_to_message)
-async def admin_reply_handler(message: types.Message):
-    # Get the text of the replied message (bot's message)
-    source_text = message.reply_to_message.text or message.reply_to_message.caption
+# ================== STEPS ==================
+STEP_LANG = "choose_language"
+STEP_CONTACT = "need_contact"
+STEP_NAME = "wait_full_name"
+STEP_READY = "registered"
+
+# ================== HELPER FUNCTIONS ==================
+def t(uid, uz, ru):
+    lang = USER_STATE.get(uid, {}).get("lang", "uz")
+    return ru if lang == "ru" else uz
+
+def lang_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.add("🇺🇿 O'zbek tili", "🇷🇺 Русский язык")
+    return kb
+
+def contact_keyboard(lang):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    text = "📋 Ro'yxatdan o'tish" if lang == "uz" else "📋 Зарегистрироваться"
+    kb.add(KeyboardButton(text, request_contact=True))
+    return kb
+
+# ================== 🚀 ADMIN BROADCAST TO ALL ==================
+# Forwards any new post from channel to all target chats
+@bot.channel_post_handler(func=lambda m: m.chat.id == SECRET_CHANNEL_ID and not m.reply_to_message,
+                          content_types=['text', 'photo', 'video', 'document', 'voice', 'audio', 'video_note', 'sticker', 'location'])
+def auto_broadcast(message):
+    logging.info(f"📢 New media/message received in channel. Starting broadcast...")
     
-    if not source_text:
+    success = 0
+    for chat_id in TARGET_CHATS:
+        try:
+            bot.copy_message(chat_id, message.chat.id, message.message_id)
+            success += 1
+            time.sleep(0.3)  # Protection from Telegram limits
+        except Exception as e:
+            logging.error(f"Error in {chat_id}: {e}")
+            
+    bot.send_message(SECRET_CHANNEL_ID, f"📊 <b>Broadcast completed</b>\n✅ Successfully sent to {success} places.")
+
+# ================== 📩 ADMIN REPLY (REPLY) ==================
+@bot.channel_post_handler(func=lambda m: m.chat.id == SECRET_CHANNEL_ID and m.reply_to_message,
+                          content_types=['text', 'photo', 'video', 'document', 'voice', 'audio', 'video_note', 'sticker'])
+def admin_reply(message):
+    rid = message.reply_to_message.message_id
+    if rid not in MESSAGE_OWNER:
         return
 
+    target_user_id = MESSAGE_OWNER[rid]
     try:
-        # Search for "ID: 1234567" pattern in the text
-        # This line is very important!
-        match = re.search(r"ID:\s?(\[?\d+\]?)", source_text)
-        
-        if match:
-            # Keep only digits
-            user_id = int(re.sub(r"\D", "", match.group(1)))
-            
-            # Send admin's message to the user
-            if message.text:
-                await bot.send_message(user_id, f"<b>Admin javobi:</b>\n\n{message.text}", parse_mode="HTML")
-                await message.reply(f"✅ Xabar yuborildi! (ID: {user_id})")
-            else:
-                await message.reply("⚠️ Faqat matnli javob yubora olasiz.")
-        else:
-            await message.reply("❌ Xatodan ID raqami topilmadi. Bot yuborgan xabarga reply qiling!")
-            
+        bot.copy_message(target_user_id, message.chat.id, message.message_id)
+        bot.send_message(message.chat.id, "✅ <b>Reply sent to user.</b>")
     except Exception as e:
-        logging.error(f"Reply xatosi: {e}")
-        await message.reply(f"❌ Yuborishda xatolik: {e}")
+        bot.send_message(message.chat.id, f"❌ <b>Error sending:</b> {e}")
 
-
-# --- 2. START AND REGISTRATION ---
-@dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Ro'yxatdan o'tish", request_contact=True)]],
-        resize_keyboard=True, one_time_keyboard=True
+# ================== 👤 USER PART (START) ==================
+@bot.message_handler(commands=['start'])
+def start(message):
+    USER_STATE[message.from_user.id] = {"step": STEP_LANG}
+    bot.send_message(
+        message.chat.id,
+        "👋 <b>Welcome!</b>\n\nPlease select your language:",
+        reply_markup=lang_keyboard()
     )
-    await message.answer(f"Salom {message.from_user.full_name}! Botdan foydalanish uchun ro'yxatdan o'ting.", reply_markup=kb)
 
+@bot.message_handler(func=lambda m: USER_STATE.get(m.from_user.id, {}).get("step") == STEP_LANG)
+def choose_lang(message):
+    uid = message.from_user.id
+    if "🇺🇿" in message.text:
+        USER_STATE[uid].update({"lang": "uz", "step": STEP_CONTACT})
+        bot.send_message(message.chat.id, "✅ <b>O'zbek tili tanlandi</b>", reply_markup=contact_keyboard("uz"))
+    elif "🇷🇺" in message.text:
+        USER_STATE[uid].update({"lang": "ru", "step": STEP_CONTACT})
+        bot.send_message(message.chat.id, "✅ <b>Русский язык выбран</b>", reply_markup=contact_keyboard("ru"))
 
-@dp.message(F.contact)
-async def contact_handler(message: types.Message):
-    user = message.from_user
-    contact = message.contact
+@bot.message_handler(content_types=['contact'])
+def get_contact(message):
+    uid = message.from_user.id
+    USER_STATE[uid]["phone"] = message.contact.phone_number
+    USER_STATE[uid]["step"] = STEP_NAME
+    bot.send_message(message.chat.id, t(uid, "✍️ <b>Ism Familiyangizni kiriting:</b>", "✍️ <b>Введите ФИО:</b>"), reply_markup=ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: USER_STATE.get(m.from_user.id, {}).get("step") == STEP_NAME)
+def get_name(message):
+    uid = message.from_user.id
+    USER_STATE[uid]["full_name"] = message.text
+    USER_STATE[uid]["step"] = STEP_READY
     
-    await message.answer("✅ Muvaffaqiyatli ro'yxatdan o'tdingiz! Endi savol yuborishingiz mumkin.", reply_markup=types.ReplyKeyboardRemove())
+    # Notification to channel
+    bot.send_message(SECRET_CHANNEL_ID, f"🆕 <b>New user:</b>\n👤 {message.text}\n📞 {USER_STATE[uid]['phone']}")
     
-    # Full report to admin
-    admin_msg = (
-        f"🌟 <b>Yangi foydalanuvchi ro'yxatdan o'tdi!</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"👤 Ism: {html.quote(user.full_name)}\n"
-        f"📞 Tel: +{contact.phone_number}\n"
-        f"🔗 Username: @{user.username if user.username else 'yoq'}\n"
-        f"🆔 ID: {user.id}\n"
-        f"━━━━━━━━━━━━━━"
-    )
-    await bot.send_message(LOG_GROUP_ID, admin_msg, parse_mode="HTML")
+    bot.send_message(message.chat.id, t(uid, "✅ <b>Ready!</b> Now send your appeal.", "✅ <b>Готово!</b> Отправьте ваше обращение."))
 
+# ================== 📨 RECEIVE APPEAL ==================
+@bot.message_handler(func=lambda m: USER_STATE.get(m.from_user.id, {}).get("step") == STEP_READY,
+                     content_types=['text', 'photo', 'video', 'document', 'voice', 'audio', 'video_note', 'sticker'])
+def get_appeal(message):
+    uid = message.from_user.id
+    u = USER_STATE[uid]
+    
+    head = f"📩 <b>New appeal</b>\n👤 {u['full_name']}\n🆔 {uid}"
+    bot.send_message(SECRET_CHANNEL_ID, head)
+    
+    # Copy any media type
+    sent = bot.copy_message(SECRET_CHANNEL_ID, message.chat.id, message.message_id)
+    MESSAGE_OWNER[sent.message_id] = uid
+    
+    bot.send_message(message.chat.id, t(uid, "🚀 <b>Sent!</b>", "🚀 <b>Отправлено!</b>"))
 
-# --- 3. CHAT AND GROQ AI ---
-@dp.message(F.chat.type == "private")
-async def chat_handler(message: types.Message):
-    if not message.text:
-        return
-
-    # Effects
-    try:
-        await message.react(reactions=[ReactionTypeEmoji(emoji="👀")])
-    except:
-        pass
-    await bot.send_chat_action(message.chat.id, "typing")
-
-    try:
-        # Get response from Groq
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": message.text}]
-        )
-        bot_res = completion.choices[0].message.content
-
-        # Beautiful formatted report to admin
-        user = message.from_user
-        log_report = (
-            f"📥 <b>Foydalanuvchi xabari:</b>\n"
-            f"«{html.quote(message.text)}»\n\n"
-            f"🤖 <b>Bot javobi:</b>\n"
-            f"«{html.quote(bot_res[:800])}...»\n\n"
-            f"👤 <b>Mijoz:</b> {html.quote(user.full_name)}\n"
-            f"🔗 <b>Username:</b> @{user.username if user.username else 'yoq'}\n"
-            f"🆔 ID: {user.id}"  # <--- This line is REQUIRED for REPLY to work!
-        )
-        
-        await bot.send_message(LOG_GROUP_ID, log_report, parse_mode="HTML")
-        await message.answer(bot_res)
-        await message.react(reactions=[])
-
-    except Exception as e:
-        await message.answer("Xatolik yuz berdi. 😵💫")
-        await bot.send_message(LOG_GROUP_ID, f"❌ Xatolik: {e}\nID: {message.from_user.id}")
-
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-
+# ================== START ==================
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("🤖 Bot running in universal mode...")
+    bot.infinity_polling(skip_pending=True)
